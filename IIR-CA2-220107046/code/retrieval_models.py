@@ -40,6 +40,27 @@ def jelinek_mercer_score(query, inverted_index, lambda_param=0.7):
     The constant log(λ*pC) is ignored since it's query-independent.
     """
     #YOUR CODE HERE
+    scores = defaultdict(float)
+    docs = list(inverted_index.doc_lengths.keys())
+    EPS = 1e-12
+
+    for w in query.tokens:
+
+        pC = inverted_index.compute_collection_prob(w)
+        postings = dict(inverted_index.get_postings(w))  
+        log_backoff = math.log(max(lambda_param * pC, EPS))
+        
+        for d in docs:
+            scores[d] += log_backoff
+
+        for d, tf in postings.items():
+
+            d_len = inverted_index.doc_lengths[d]
+            p_ml = tf / d_len if d_len > 0 else 0.0
+            p = (1 - lambda_param) * p_ml + lambda_param * pC
+            scores[d] += math.log(max(p, EPS)) - log_backoff
+
+    return scores
 
 
 def dirichlet_prior_score(query, inverted_index, mu=2000):
@@ -50,6 +71,25 @@ def dirichlet_prior_score(query, inverted_index, mu=2000):
     log P(q|d) = sum_w log(1 + tf/(μ*pC)) + |q| * log(μ / (|d| + μ))
     """
     #YOUR CODE HERE
+    scores = defaultdict(float)
+    docs = inverted_index.doc_lengths.keys()
+    EPS = 1e-12
+
+    for w in query.tokens:
+
+        p_wc = inverted_index.compute_collection_prob(w)
+        postings = dict(inverted_index.get_postings(w))
+
+        for d in docs:
+            d_len = inverted_index.doc_lengths[d]
+            tf = postings.get(d, 0)
+
+            denom = d_len + mu
+            p = (tf + mu * p_wc) / denom if denom > 0 else EPS
+
+            scores[d] += math.log(max(p, EPS))
+
+    return scores
 
 
 def absolute_discounting_score(query, inverted_index, delta=0.7):
@@ -60,6 +100,36 @@ def absolute_discounting_score(query, inverted_index, delta=0.7):
     log p(w|d) ≈ log(δ*|d|_u/|d|*pC) + log(1 + max(tf-δ,0)/(δ*|d|_u*pC))
     """
     #YOUR CODE HERE
+    scores = defaultdict(float)
+    docs = inverted_index.doc_lengths.keys()
+    EPS = 1e-12
+
+    for w in query.tokens:
+
+        p_wc = inverted_index.compute_collection_prob(w)
+        postings = dict(inverted_index.get_postings(w))
+
+        for d in docs:
+            d_len = inverted_index.doc_lengths[d]
+
+            if d_len == 0:
+                scores[d] += math.log(EPS)
+                continue
+
+            tf = postings.get(d, 0)
+
+            unique_terms = len(set(inverted_index.doc_tokens[d]))
+
+            first = max(tf - delta, 0.0) / d_len
+            second = (delta * unique_terms / d_len) * p_wc
+            p = first + second
+
+            if p <= 0:
+                p = 1e-12
+
+            scores[d] += math.log(max(p, EPS))
+
+    return scores
 
 
 def _safe_log(x, eps=1e-12):
@@ -129,9 +199,24 @@ def mixture_model_prf(query, inverted_index, top_n=10, num_expansion_terms=10,
 
         # --------- E-step (gamma[t] = p(z=1|t) background responsibility) ---------
         #YOUR CODE HERE
+        gamma = {}
+        for t in vocab:
+            p_bg = lambda_val * P_bg[t]
+            p_topic = (1 - lambda_val) * P_w_R[t]
+            denom = p_bg + p_topic
+            if denom == 0:
+                gamma[t] = 0.0
+            else:
+                gamma[t] = p_bg / denom 
 
         # --------- M-step (update P_w_R and λ) ---------
         #YOUR CODE HERE
+        numerator = {t: term_counts[t] * (1 - gamma[t]) for t in vocab}
+        denom = sum(numerator.values()) or 1e-12
+
+        P_w_R = {t: numerator[t] / denom for t in vocab}
+        
+        lambda_val = sum(term_counts[t] * gamma[t] for t in vocab) / total_top_terms
 
         # convergence check
         diff = sum(abs(P_w_R[t] - P_w_R_old[t]) for t in vocab)
@@ -197,7 +282,20 @@ def divergence_minimization_prf(query, inverted_index, top_n=10,
     #   4. Store result in log_terms[w]
     # 
     # Hint: Use math.log() and be careful with zero probabilities (use eps)
-  
+    for w in vocab:
+        sum_log = 0.0
+        for d in top_docs:
+            p = doc_models[d].get(w, eps)
+            sum_log += math.log(p + eps)
+
+        p_c = inverted_index.compute_collection_prob(w)
+        log_pc = math.log(p_c + eps)
+
+        coeff1 = 1.0 / ((1 - lambda_param) * F_size)
+        coeff2 = lambda_param / (1 - lambda_param)
+
+        log_terms[w] = coeff1 * sum_log - coeff2 * log_pc
+
 
     # 5) Normalize using log-sum-exp
     max_log = max(log_terms.values())
@@ -214,6 +312,20 @@ def divergence_minimization_prf(query, inverted_index, top_n=10,
     #
     # Hint: Skip words that are already in query.tokens
     chosen = []
+    original = set(query.tokens)
+
+    for w, pwF in feedback_model.items():
+        if w in original:
+            continue
+
+        pC = inverted_index.compute_collection_prob(w) + eps
+
+        score = math.log(pwF + eps) - math.log(pC)
+        chosen.append((w, score))
+
+    chosen.sort(key=lambda x: x[1], reverse=True)
+    chosen = chosen[:num_expansion_terms]
+
 
     # ========================================
     # END OF YOUR CODE
@@ -229,18 +341,56 @@ def divergence_minimization_prf(query, inverted_index, top_n=10,
     return query
 
 def rm3_prf(query, inverted_index, top_n=10, num_expansion_terms=15, alpha=0.6):
-       """
-       RM3: Regularized Relevance Model
-       
-       Args:
-           query: Query object
-           inverted_index: InvertedIndex object
-           top_n: Number of feedback documents
-           num_expansion_terms: Number of terms to add
-           alpha: Interpolation weight for feedback model (0.5-0.8)
-       
-       Returns:
-           Expanded query with regularization
-       """
-       # YOUR CODE HERE
-       pass
+    """
+    RM3: Regularized Relevance Model
+    
+    Args:
+        query: Query object
+        inverted_index: InvertedIndex object
+        top_n: Number of feedback documents
+        num_expansion_terms: Number of terms to add
+        alpha: Interpolation weight for feedback model (0.5-0.8)
+    
+    Returns:
+        Expanded query with regularization
+    """
+    # YOUR CODE HERE
+    # 1) Retrieve top documents
+    initial_scores = bm25_score(query, inverted_index)
+    ranked_docs = sorted(initial_scores.items(), key=lambda x: x[1], reverse=True)
+    top_docs = [d for d, _ in ranked_docs[:top_n]]
+
+    if not top_docs:
+        return query
+    
+    # 2) Compute p(d|Q)
+    eps = 1e-12
+    scores = {d: max(initial_scores.get(d, eps), eps) for d in top_docs}
+    sum_scores = sum(scores.values())
+    p_d_q = {d: scores[d] / sum_scores for d in top_docs}
+
+    # 3) Build RM3 model
+    original_terms = set(query.tokens)
+    combined_model = {}
+    for t in p_d_q:
+        p_fb = p_d_q[t]
+        p_q = 1.0 if t in original_terms else 0.0
+        combined_model[t] = alpha * p_fb + (1 - alpha) * p_q
+     
+    # 4) select expansion terms
+    candidates = sorted(combined_model.items(), key=lambda x: x[1], reverse=True)
+    expansion_terms = {}
+    for t, p in candidates:
+        if t not in original_terms:
+            expansion_terms[t] = p
+        if len(expansion_terms) >= num_expansion_terms:
+            break
+
+    # normalize
+    if expansion_terms:
+        m = max(expansion_terms.values())
+        expansion_terms = {t: p/m for t, p in expansion_terms.items()}
+
+    query.expand(expansion_terms)
+
+    return query
