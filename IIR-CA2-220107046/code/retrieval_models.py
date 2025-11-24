@@ -41,25 +41,19 @@ def jelinek_mercer_score(query, inverted_index, lambda_param=0.7):
     """
     #YOUR CODE HERE
     scores = defaultdict(float)
-    docs = list(inverted_index.doc_lengths.keys())
-    EPS = 1e-12
-
-    for w in query.tokens:
-
-        pC = inverted_index.compute_collection_prob(w)
-        postings = dict(inverted_index.get_postings(w))  
-        log_backoff = math.log(max(lambda_param * pC, EPS))
+    
+    for term in query.tokens:
+        P_w_C = inverted_index.compute_collection_prob(term)
+        postings = inverted_index.get_postings(term)
         
-        for d in docs:
-            scores[d] += log_backoff
-
-        for d, tf in postings.items():
-
-            d_len = inverted_index.doc_lengths[d]
-            p_ml = tf / d_len if d_len > 0 else 0.0
-            p = (1 - lambda_param) * p_ml + lambda_param * pC
-            scores[d] += math.log(max(p, EPS)) - log_backoff
-
+        for doc_id, c_w_d in postings:
+            doc_len = inverted_index.doc_lengths[doc_id]
+            P_w_d = c_w_d / doc_len
+            
+            smoothed_prob = (1 - lambda_param) * P_w_d + lambda_param * P_w_C
+       
+            scores[doc_id] += _safe_log(smoothed_prob)
+    
     return scores
 
 
@@ -72,23 +66,18 @@ def dirichlet_prior_score(query, inverted_index, mu=2000):
     """
     #YOUR CODE HERE
     scores = defaultdict(float)
-    docs = inverted_index.doc_lengths.keys()
-    EPS = 1e-12
-
-    for w in query.tokens:
-
-        p_wc = inverted_index.compute_collection_prob(w)
-        postings = dict(inverted_index.get_postings(w))
-
-        for d in docs:
-            d_len = inverted_index.doc_lengths[d]
-            tf = postings.get(d, 0)
-
-            denom = d_len + mu
-            p = (tf + mu * p_wc) / denom if denom > 0 else EPS
-
-            scores[d] += math.log(max(p, EPS))
-
+    
+    for term in query.tokens:
+        P_w_C = inverted_index.compute_collection_prob(term)
+        postings = inverted_index.get_postings(term)
+        
+        for doc_id, c_w_d in postings:
+            doc_len = inverted_index.doc_lengths[doc_id]
+            
+            smoothed_prob = (c_w_d + mu * P_w_C) / (doc_len + mu)
+            
+            scores[doc_id] += _safe_log(smoothed_prob)
+    
     return scores
 
 
@@ -101,34 +90,22 @@ def absolute_discounting_score(query, inverted_index, delta=0.7):
     """
     #YOUR CODE HERE
     scores = defaultdict(float)
-    docs = inverted_index.doc_lengths.keys()
-    EPS = 1e-12
+    
+    for term in query.tokens:
+        P_w_C = inverted_index.compute_collection_prob(term)
+        postings = inverted_index.get_postings(term)
+        
+        for doc_id, c_w_d in postings:
+            doc_len = inverted_index.doc_lengths[doc_id]
 
-    for w in query.tokens:
+            c_w_d_discounted = max(c_w_d - delta, 0)
 
-        p_wc = inverted_index.compute_collection_prob(w)
-        postings = dict(inverted_index.get_postings(w))
-
-        for d in docs:
-            d_len = inverted_index.doc_lengths[d]
-
-            if d_len == 0:
-                scores[d] += math.log(EPS)
-                continue
-
-            tf = postings.get(d, 0)
-
-            unique_terms = len(set(inverted_index.doc_tokens[d]))
-
-            first = max(tf - delta, 0.0) / d_len
-            second = (delta * unique_terms / d_len) * p_wc
-            p = first + second
-
-            if p <= 0:
-                p = 1e-12
-
-            scores[d] += math.log(max(p, EPS))
-
+            doc_u_count = inverted_index.term_doc_freq[term]
+            
+            smoothed_prob = (c_w_d_discounted / doc_len) + (delta * doc_u_count / doc_len) * P_w_C
+            
+            scores[doc_id] += _safe_log(smoothed_prob)
+    
     return scores
 
 
@@ -199,24 +176,19 @@ def mixture_model_prf(query, inverted_index, top_n=10, num_expansion_terms=10,
 
         # --------- E-step (gamma[t] = p(z=1|t) background responsibility) ---------
         #YOUR CODE HERE
-        gamma = {}
-        for t in vocab:
-            p_bg = lambda_val * P_bg[t]
-            p_topic = (1 - lambda_val) * P_w_R[t]
-            denom = p_bg + p_topic
-            if denom == 0:
-                gamma[t] = 0.0
-            else:
-                gamma[t] = p_bg / denom 
+        P_z_1_given_w = {}
+        for word in vocab:
+            P_z_1_given_w[word] = (lambda_val * P_bg[word]) / (lambda_val * P_bg[word] + (1 - lambda_val) * P_w_R[word])
 
         # --------- M-step (update P_w_R and λ) ---------
         #YOUR CODE HERE
-        numerator = {t: term_counts[t] * (1 - gamma[t]) for t in vocab}
-        denom = sum(numerator.values()) or 1e-12
+        term_count_sum = 0
+        for term in vocab:
+            term_count_in_docs = sum([inverted_index.get_postings(doc_id).count(term) for doc_id in top_docs])
+            term_count_sum += term_count_in_docs * (1 - P_z_1_given_w[term])
 
-        P_w_R = {t: numerator[t] / denom for t in vocab}
-        
-        lambda_val = sum(term_counts[t] * gamma[t] for t in vocab) / total_top_terms
+        for term in vocab:
+            P_w_R[term] = (term_counts[term] * (1 - P_z_1_given_w[term])) / term_count_sum
 
         # convergence check
         diff = sum(abs(P_w_R[t] - P_w_R_old[t]) for t in vocab)
@@ -282,19 +254,18 @@ def divergence_minimization_prf(query, inverted_index, top_n=10,
     #   4. Store result in log_terms[w]
     # 
     # Hint: Use math.log() and be careful with zero probabilities (use eps)
-    for w in vocab:
-        sum_log = 0.0
-        for d in top_docs:
-            p = doc_models[d].get(w, eps)
-            sum_log += math.log(p + eps)
+    for term in vocab:
+        sum_log_p_w_theta = 0
+        for doc_id in top_docs:
+            doc_model = doc_models[doc_id]
+            p_w_given_doc = doc_model.get(term, eps)
+            sum_log_p_w_theta += math.log(p_w_given_doc)
 
-        p_c = inverted_index.compute_collection_prob(w)
-        log_pc = math.log(p_c + eps)
+        p_w_collection = inverted_index.compute_collection_prob(term)
+        p_w_collection = max(p_w_collection, eps)
+        log_p_w_collection = math.log(p_w_collection)
 
-        coeff1 = 1.0 / ((1 - lambda_param) * F_size)
-        coeff2 = lambda_param / (1 - lambda_param)
-
-        log_terms[w] = coeff1 * sum_log - coeff2 * log_pc
+        log_terms[term] = (1 / ((1 - lambda_param) * F_size)) * sum_log_p_w_theta - (lambda_param / (1 - lambda_param)) * log_p_w_collection
 
 
     # 5) Normalize using log-sum-exp
@@ -311,19 +282,16 @@ def divergence_minimization_prf(query, inverted_index, top_n=10,
     #   3. Select top num_expansion_terms
     #
     # Hint: Skip words that are already in query.tokens
+    chosen = chosen[:num_expansion_terms]
     chosen = []
-    original = set(query.tokens)
+    query_terms = set(query.tokens)
 
-    for w, pwF in feedback_model.items():
-        if w in original:
-            continue
+    for term, score in feedback_model.items():
+        if term not in query_terms:
+            kl_divergence_score = math.log(score) - log_p_w_collection
+            chosen.append((term, kl_divergence_score))
 
-        pC = inverted_index.compute_collection_prob(w) + eps
-
-        score = math.log(pwF + eps) - math.log(pC)
-        chosen.append((w, score))
-
-    chosen.sort(key=lambda x: x[1], reverse=True)
+    chosen = sorted(chosen, key=lambda x: x[1], reverse=True)
     chosen = chosen[:num_expansion_terms]
 
 
@@ -355,42 +323,46 @@ def rm3_prf(query, inverted_index, top_n=10, num_expansion_terms=15, alpha=0.6):
         Expanded query with regularization
     """
     # YOUR CODE HERE
-    # 1) Retrieve top documents
     initial_scores = bm25_score(query, inverted_index)
     ranked_docs = sorted(initial_scores.items(), key=lambda x: x[1], reverse=True)
-    top_docs = [d for d, _ in ranked_docs[:top_n]]
-
+    top_docs = [doc_id for doc_id, _ in ranked_docs[:top_n]]
     if not top_docs:
         return query
-    
-    # 2) Compute p(d|Q)
-    eps = 1e-12
-    scores = {d: max(initial_scores.get(d, eps), eps) for d in top_docs}
-    sum_scores = sum(scores.values())
-    p_d_q = {d: scores[d] / sum_scores for d in top_docs}
 
-    # 3) Build RM3 model
-    original_terms = set(query.tokens)
-    combined_model = {}
-    for t in p_d_q:
-        p_fb = p_d_q[t]
-        p_q = 1.0 if t in original_terms else 0.0
-        combined_model[t] = alpha * p_fb + (1 - alpha) * p_q
-     
-    # 4) select expansion terms
-    candidates = sorted(combined_model.items(), key=lambda x: x[1], reverse=True)
-    expansion_terms = {}
-    for t, p in candidates:
-        if t not in original_terms:
-            expansion_terms[t] = p
-        if len(expansion_terms) >= num_expansion_terms:
-            break
+    doc_language_models = {
+        doc_id: compute_doc_language_model(inverted_index, doc_id, mu=2000)
+        for doc_id in top_docs
+    }
 
-    # normalize
+    all_terms = set()
+    for doc_id in top_docs:
+        all_terms.update(doc_language_models[doc_id].keys())
+
+    query_weights = {term: 1 if term in query.tokens else 0 for term in all_terms}
+
+    feedback_weights = {}
+    for term in all_terms:
+        log_sum = 0
+        for doc_id in top_docs:
+            doc_model = doc_language_models[doc_id]
+            log_sum += math.log(doc_model.get(term, 1e-12))
+        feedback_weights[term] = math.exp(log_sum / len(top_docs))
+
+    combined_weights = {
+        term: alpha * query_weights.get(term, 0) + (1 - alpha) * feedback_weights.get(term, 0)
+        for term in all_terms
+    }
+
+    expansion_terms = {
+        term: score for term, score in sorted(combined_weights.items(), key=lambda x: x[1], reverse=True)
+        if term not in query.tokens
+    }
+
+    expansion_terms = dict(list(expansion_terms.items())[:num_expansion_terms])
+
     if expansion_terms:
-        m = max(expansion_terms.values())
-        expansion_terms = {t: p/m for t, p in expansion_terms.items()}
-
-    query.expand(expansion_terms)
+        max_score = max(expansion_terms.values())
+        normalized_expansion_terms = {term: score / max_score for term, score in expansion_terms.items()}
+        query.expand(normalized_expansion_terms)
 
     return query
